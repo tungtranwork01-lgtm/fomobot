@@ -67,24 +67,80 @@ END;
 $$;
 
 -- ============================================================
--- 3. Bảng RAG: lưu chunk text từ tài liệu (không cần pgvector)
+-- 3. Bảng RAG: lưu chunk text + embedding (vector) để tìm kiếm ngữ nghĩa
 -- ============================================================
 
--- Bật extension tìm kiếm gần đúng (cần cho ILIKE nhanh)
+-- Bật extension vector (embedding) và tìm kiếm gần đúng (fallback)
+CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE TABLE IF NOT EXISTS rag_chunks (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   source TEXT,
   content TEXT NOT NULL,
+  embedding vector(1536),
   created_at TIMESTAMPTZ DEFAULT now()
 );
+
+-- Thêm cột embedding nếu bảng đã tồn tại từ trước (chạy migration)
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'rag_chunks' AND column_name = 'embedding'
+  ) THEN
+    ALTER TABLE rag_chunks ADD COLUMN embedding vector(1536);
+  END IF;
+END $$;
+
+-- Index cho tìm kiếm vector (cosine distance)
+CREATE INDEX IF NOT EXISTS rag_chunks_embedding_idx
+  ON rag_chunks USING hnsw (embedding vector_cosine_ops)
+  WHERE embedding IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS rag_chunks_content_trgm_idx
   ON rag_chunks USING gin (content gin_trgm_ops);
 
 -- ============================================================
--- 4. Hàm tìm chunk theo từ khóa (ILIKE + ranking)
+-- 4. Hàm tìm chunk theo embedding (vector similarity)
+-- query_embedding_text: dạng '[0.1, -0.2, ...]' (1536 số) từ client
+-- ============================================================
+CREATE OR REPLACE FUNCTION search_rag_by_embedding(
+  query_embedding_text text,
+  match_count int DEFAULT 10
+)
+RETURNS TABLE(id uuid, source text, content text, similarity float)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  q vector(1536);
+BEGIN
+  q := query_embedding_text::vector(1536);
+  RETURN QUERY
+  SELECT
+    c.id, c.source, c.content,
+    (1 - (c.embedding <=> q))::float AS similarity
+  FROM rag_chunks c
+  WHERE c.embedding IS NOT NULL
+  ORDER BY c.embedding <=> q
+  LIMIT match_count;
+END;
+$$;
+
+-- Xóa toàn bộ chunk (gọi trước khi re-index)
+CREATE OR REPLACE FUNCTION truncate_rag_chunks()
+RETURNS void
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  TRUNCATE TABLE rag_chunks;
+$$;
+
+-- ============================================================
+-- 5. Hàm tìm chunk theo từ khóa (fallback khi chưa có embedding)
 -- ============================================================
 CREATE OR REPLACE FUNCTION search_rag_chunks(
   keywords text[],

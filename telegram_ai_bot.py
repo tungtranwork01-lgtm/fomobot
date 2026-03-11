@@ -49,6 +49,11 @@ OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL") or "").strip() or None
 _default_model = "deepseek-chat" if (OPENAI_BASE_URL and "deepseek" in OPENAI_BASE_URL.lower()) else "gpt-4o-mini"
 AI_MODEL = os.getenv("AI_MODEL", _default_model).strip() or _default_model
 
+# Embedding (RAG): dùng API OpenAI riêng để embed tài liệu (chat vẫn dùng OPENAI_API_KEY + BASE_URL)
+OPENAI_EMBEDDING_API_KEY = (os.getenv("OPENAI_EMBEDDING_API_KEY") or "").strip() or None
+OPENAI_EMBEDDING_BASE_URL = (os.getenv("OPENAI_EMBEDDING_BASE_URL") or "").strip() or "https://api.openai.com/v1"
+EMBEDDING_MODEL = (os.getenv("EMBEDDING_MODEL") or "text-embedding-3-small").strip()
+
 # Supabase
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip() or None
 SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip() or None
@@ -56,12 +61,13 @@ SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip() or None
 # Cache schema thật từ DB (tự động lấy khi cần)
 _cached_schema: Optional[str] = None
 
-# RAG: Supabase Storage + keyword search (không cần embedding API)
+# RAG: Storage + embedding (OpenAI) + vector search
 SUPABASE_RAG_BUCKET = (os.getenv("SUPABASE_RAG_BUCKET") or "documents").strip()
 SUPABASE_RAG_TABLE = (os.getenv("SUPABASE_RAG_TABLE") or "rag_chunks").strip()
 RAG_CHUNK_SIZE = max(100, min(2000, int(os.getenv("RAG_CHUNK_SIZE", "800"))))
 RAG_CHUNK_OVERLAP = max(0, min(200, int(os.getenv("RAG_CHUNK_OVERLAP", "100"))))
 RAG_TOP_K = max(1, min(20, int(os.getenv("RAG_TOP_K", "8"))))
+RAG_EMBEDDING_BATCH = max(1, min(100, int(os.getenv("RAG_EMBEDDING_BATCH", "50"))))
 
 # Lưu lịch sử hội thoại theo user (chat_id -> list messages)
 user_conversations: Dict[int, List[dict]] = {}
@@ -71,14 +77,28 @@ MAX_HISTORY = 20
 query_history: Dict[int, List[dict]] = {}
 MAX_QUERY_HISTORY = 10
 
+# Bật/tắt chế độ thinking (reasoning) theo user: chat_id -> True/False
+user_thinking: Dict[int, bool] = {}
+
 
 # ======================= CLIENTS =======================
 
 def get_openai_client() -> OpenAI:
+    """Client cho chat (dùng OPENAI_API_KEY, có thể trỏ Deepseek)."""
     kwargs = {"api_key": OPENAI_API_KEY}
     if OPENAI_BASE_URL:
         kwargs["base_url"] = OPENAI_BASE_URL
     return OpenAI(**kwargs)
+
+
+def get_embedding_client() -> Optional[OpenAI]:
+    """Client chỉ cho embedding (OpenAI). Dùng OPENAI_EMBEDDING_API_KEY riêng."""
+    if not OPENAI_EMBEDDING_API_KEY:
+        return None
+    return OpenAI(
+        api_key=OPENAI_EMBEDDING_API_KEY,
+        base_url=OPENAI_EMBEDDING_BASE_URL or "https://api.openai.com/v1",
+    )
 
 
 def get_supabase_client() -> Optional[Any]:
@@ -136,7 +156,27 @@ def refresh_schema_cache() -> None:
     _cached_schema = None
 
 
-# ======================= RAG: chunking, storage, keyword search =======================
+# ======================= RAG: embedding + vector search =======================
+
+
+def get_embeddings(client: OpenAI, texts: List[str], batch_size: int = RAG_EMBEDDING_BATCH) -> List[List[float]]:
+    """Gọi API embedding (OpenAI), trả về list vector 1536 chiều. Batch để tránh quá tải."""
+    out: List[List[float]] = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        try:
+            r = client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
+            for e in (r.data or []):
+                emb = getattr(e, "embedding", None)
+                if emb is not None:
+                    out.append(emb)
+                else:
+                    out.append([])
+        except Exception as e:
+            logger.warning("get_embeddings batch %s: %s", i, e)
+            for _ in batch:
+                out.append([])
+    return out
 
 
 def chunk_text(text: str, chunk_size: int = RAG_CHUNK_SIZE, overlap: int = RAG_CHUNK_OVERLAP) -> List[str]:
@@ -216,12 +256,32 @@ def _extract_pdf_text(data: bytes) -> Optional[str]:
     return None
 
 
-def rag_index_storage(sb: Any, bucket: str) -> Tuple[int, str]:
+def _embedding_to_text(emb: List[float]) -> str:
+    """Chuyển list float sang chuỗi '[a,b,c,...]' để gửi RPC vector."""
+    return "[" + ",".join(str(x) for x in emb) + "]"
+
+
+def rag_vector_search(sb: Any, embedding: List[float], top_k: int = RAG_TOP_K) -> List[dict]:
+    """Tìm chunk theo độ tương đồng vector (RPC search_rag_by_embedding)."""
+    if not embedding or len(embedding) != 1536:
+        return []
+    try:
+        r = sb.rpc(
+            "search_rag_by_embedding",
+            {"query_embedding_text": _embedding_to_text(embedding), "match_count": top_k},
+        ).execute()
+        return (r.data or []) if hasattr(r, "data") else []
+    except Exception as e:
+        logger.warning("RAG vector search: %s", e)
+        return []
+
+
+def rag_index_storage(sb: Any, bucket: str, embedding_client: Optional[OpenAI] = None) -> Tuple[int, str]:
+    """Quét Storage, chunk, embed (nếu có API), rồi insert vào rag_chunks."""
     paths = _list_storage_files(sb, bucket)
     text_ext = (".txt", ".md", ".csv", ".json", ".log", ".py", ".js", ".html", ".htm", ".xml", ".yaml", ".yml", ".rst")
-    total_chunks = 0
+    all_chunks: List[Tuple[str, str]] = []
     errors = []
-    indexed_files = 0
     for path in paths:
         is_pdf = path.lower().endswith(".pdf")
         is_text = any(path.lower().endswith(ext) for ext in text_ext)
@@ -248,22 +308,56 @@ def rag_index_storage(sb: Any, bucket: str) -> Tuple[int, str]:
             chunks = chunk_text(text)
             if not chunks:
                 continue
-            rows = [{"source": path, "content": c} for c in chunks]
-            sb.table(SUPABASE_RAG_TABLE).insert(rows).execute()
-            total_chunks += len(rows)
-            indexed_files += 1
+            for c in chunks:
+                all_chunks.append((path, c))
         except Exception as e:
             errors.append(f"{path}: {e}")
-    msg = f"Đã index {indexed_files} file, {total_chunks} chunk (tổng {len(paths)} file trong bucket)."
+
+    if not all_chunks:
+        return 0, f"Không có file text/PDF nào trong bucket (đã quét {len(paths)} file). " + ("Lỗi: " + "; ".join(errors[:3]) if errors else "")
+
+    contents = [c for _, c in all_chunks]
+    embeddings: List[List[float]] = []
+    if embedding_client:
+        embeddings = get_embeddings(embedding_client, contents)
+        if len(embeddings) != len(contents):
+            errors.append("Số embedding không khớp số chunk; kiểm tra OPENAI_EMBEDDING_API_KEY và EMBEDDING_MODEL.")
+    else:
+        embeddings = [[] for _ in contents]
+
+    # Xóa dữ liệu cũ (re-index toàn bộ)
+    try:
+        sb.rpc("truncate_rag_chunks", {}).execute()
+    except Exception as e:
+        logger.warning("RAG clear old chunks: %s", e)
+
+    batch_size = 100
+    inserted = 0
+    for i in range(0, len(all_chunks), batch_size):
+        batch = all_chunks[i : i + batch_size]
+        embs = embeddings[i : i + batch_size]
+        rows = []
+        for j, (source, content) in enumerate(batch):
+            row = {"source": source, "content": content}
+            if j < len(embs) and embs[j]:
+                row["embedding"] = _embedding_to_text(embs[j])
+            rows.append(row)
+        try:
+            sb.table(SUPABASE_RAG_TABLE).insert(rows).execute()
+            inserted += len(rows)
+        except Exception as e:
+            errors.append(f"insert batch: {e}")
+
+    msg = f"Đã index {len(paths)} file, {inserted} chunk (embedding: {'có' if embedding_client else 'không'})."
     if errors:
         msg += " Lỗi: " + "; ".join(errors[:5])
         if len(errors) > 5:
             msg += f" (+{len(errors) - 5} lỗi khác)"
-    return total_chunks, msg
+    return inserted, msg
 
 
 def rag_keyword_search(sb: Any, keywords: List[str], top_k: int = RAG_TOP_K) -> List[dict]:
-    """Tìm chunk bằng từ khóa (RPC search_rag_chunks)."""
+    """Tìm chunk bằng từ khóa (fallback khi không có embedding)."""
     if not keywords:
         return []
     try:
@@ -275,16 +369,14 @@ def rag_keyword_search(sb: Any, keywords: List[str], top_k: int = RAG_TOP_K) -> 
 
 
 def extract_keywords_from_question(client: OpenAI, question: str) -> List[str]:
-    """Dùng AI trích xuất từ khóa tìm kiếm từ câu hỏi."""
+    """Trích từ khóa từ câu hỏi (fallback khi không dùng embedding)."""
     try:
         resp = client.chat.completions.create(
             model=AI_MODEL,
             messages=[
                 {"role": "system", "content": (
                     "Trích xuất 3-8 từ khóa quan trọng từ câu hỏi để tìm kiếm trong tài liệu. "
-                    "Trả về CHỈ các từ khóa, mỗi từ cách nhau bằng dấu phẩy, không giải thích. "
-                    "Bao gồm cả từ gốc và biến thể (ví dụ: 'bảo hành' → 'bảo hành, warranty'). "
-                    "Ưu tiên danh từ, tên riêng, thuật ngữ chuyên ngành."
+                    "Trả về CHỈ các từ khóa, mỗi từ cách nhau bằng dấu phẩy, không giải thích."
                 )},
                 {"role": "user", "content": question},
             ],
@@ -304,6 +396,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Chào! Gửi tin nhắn để chat với AI.",
         "/clear - Xóa lịch sử hội thoại.",
         "/model - Xem model đang dùng.",
+        "/think - Bật/tắt chế độ suy nghĩ (reasoning): AI sẽ trình bày bước suy luận trước khi trả lời.",
     ]
     if get_supabase_client():
         lines.append("/query <câu hỏi> - Truy vấn CSDL bằng ngôn ngữ tự nhiên.")
@@ -322,6 +415,25 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if chat_id in query_history:
         del query_history[chat_id]
     await update.message.reply_text("Đã xóa lịch sử hội thoại và lịch sử truy vấn.")
+
+
+async def cmd_think(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bật/tắt chế độ thinking: AI suy nghĩ từng bước trước khi trả lời."""
+    chat_id = update.effective_chat.id
+    current = user_thinking.get(chat_id, False)
+    user_thinking[chat_id] = not current
+    new_state = user_thinking[chat_id]
+    if new_state:
+        await update.message.reply_text(
+            "Đã bật chế độ **Suy nghĩ** (reasoning).\n"
+            "Từ giờ mỗi khi bạn chat, AI sẽ trình bày phần suy luận trước, rồi mới đưa ra câu trả lời.\n"
+            "Gõ /think lần nữa để tắt.",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            "Đã tắt chế độ Suy nghĩ. Chat sẽ trả lời trực tiếp.\nGõ /think để bật lại."
+        )
 
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -488,17 +600,24 @@ async def cmd_rag_index(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not sb:
         await update.message.reply_text("Chưa cấu hình Supabase (SUPABASE_URL, SUPABASE_KEY).")
         return
-    await update.message.reply_text("Đang quét Storage (PDF + text files) và tạo embedding... Vui lòng đợi.")
+    emb_client = get_embedding_client()
+    if not emb_client:
+        await update.message.reply_text(
+            "Chưa cấu hình OPENAI_EMBEDDING_API_KEY trong .env. "
+            "RAG cần API key OpenAI riêng để embed tài liệu (xem hướng dẫn trong .env.example)."
+        )
+        return
+    await update.message.reply_text("Đang quét Storage, tạo embedding và lưu... Vui lòng đợi.")
     try:
-        total, msg = rag_index_storage(sb, SUPABASE_RAG_BUCKET)
+        total, msg = rag_index_storage(sb, SUPABASE_RAG_BUCKET, embedding_client=emb_client)
         await update.message.reply_text(msg)
     except Exception as e:
         logger.exception("rag_index: %s", e)
-        await update.message.reply_text(f"Lỗi: {str(e)}. Kiểm tra bucket '{SUPABASE_RAG_BUCKET}', bảng '{SUPABASE_RAG_TABLE}' và RPC '{RAG_MATCH_RPC}'.")
+        await update.message.reply_text(f"Lỗi: {str(e)}. Kiểm tra bucket '{SUPABASE_RAG_BUCKET}', bảng '{SUPABASE_RAG_TABLE}' và QUERY_SETUP.sql (pgvector, search_rag_by_embedding).")
 
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Trả lời câu hỏi dựa trên tài liệu đã index (RAG)."""
+    """Trả lời câu hỏi dựa trên tài liệu đã index (RAG). Ưu tiên tìm theo embedding."""
     sb = get_supabase_client()
     if not sb:
         await update.message.reply_text("Chưa cấu hình Supabase.")
@@ -515,14 +634,25 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.chat.send_action("typing")
 
     try:
-        client = get_openai_client()
-        keywords = extract_keywords_from_question(client, user_question)
-        logger.info("RAG keywords: %s", keywords)
+        chat_client = get_openai_client()
+        emb_client = get_embedding_client()
+        chunks: List[dict] = []
 
-        chunks = rag_keyword_search(sb, keywords, top_k=RAG_TOP_K)
+        if emb_client:
+            # Tìm theo embedding (chuẩn)
+            q_emb = get_embeddings(emb_client, [user_question], batch_size=1)
+            if q_emb and q_emb[0]:
+                chunks = rag_vector_search(sb, q_emb[0], top_k=RAG_TOP_K)
+                logger.info("RAG vector search: %s chunks", len(chunks))
+        if not chunks and chat_client:
+            # Fallback: tìm theo từ khóa
+            keywords = extract_keywords_from_question(chat_client, user_question)
+            chunks = rag_keyword_search(sb, keywords, top_k=RAG_TOP_K)
+            logger.info("RAG keyword fallback: %s", keywords)
+
         if not chunks:
             await update.message.reply_text(
-                "Không tìm thấy tài liệu liên quan. Chạy /rag_index để index file trong Storage trước."
+                "Không tìm thấy tài liệu liên quan. Chạy /rag_index (cần OPENAI_EMBEDDING_API_KEY) để index file trước."
             )
             return
         context_parts = []
@@ -537,7 +667,7 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Nếu ngữ cảnh không đủ để trả lời, hãy nói rõ. Trả lời ngắn gọn, rõ ràng, bằng tiếng Việt."
         )
         user_msg = f"Ngữ cảnh tài liệu:\n\n{context_text}\n\nCâu hỏi: {user_question}"
-        resp = client.chat.completions.create(
+        resp = chat_client.chat.completions.create(
             model=AI_MODEL,
             messages=[
                 {"role": "system", "content": system},
@@ -580,7 +710,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         client = get_openai_client()
         history = get_messages_for_user(chat_id)
-        messages = [{"role": "system", "content": "Bạn là trợ lý hữu ích. Trả lời ngắn gọn, rõ ràng."}]
+        thinking_on = user_thinking.get(chat_id, False)
+        if thinking_on:
+            system = (
+                "Bạn là trợ lý hữu ích. Khi trả lời, LUÔN làm theo đúng format sau:\n\n"
+                "**Suy nghĩ:**\n(Trình bày từng bước suy luận, phân tích câu hỏi, cân nhắc các khả năng trước khi kết luận. Dùng tiếng Việt.)\n\n"
+                "**Trả lời:**\n(Câu trả lời ngắn gọn, rõ ràng dựa trên phần suy nghĩ trên.)\n\n"
+                "Nếu câu hỏi đơn giản thì phần Suy nghĩ có thể ngắn, nhưng luôn có đủ hai phần."
+            )
+        else:
+            system = "Bạn là trợ lý hữu ích. Trả lời ngắn gọn, rõ ràng."
+        messages = [{"role": "system", "content": system}]
         messages.extend(history)
         messages.append({"role": "user", "content": user_text})
 
@@ -593,11 +733,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         add_to_conversation(chat_id, "user", user_text)
         add_to_conversation(chat_id, "assistant", reply)
 
+        use_md = thinking_on and len(reply) <= 4000
         if len(reply) > 4000:
             for i in range(0, len(reply), 4000):
                 await update.message.reply_text(reply[i : i + 4000])
         else:
-            await update.message.reply_text(reply)
+            await update.message.reply_text(
+                reply, parse_mode="Markdown" if use_md else None
+            )
 
     except Exception as e:
         logger.exception("Lỗi khi gọi AI: %s", e)
@@ -622,6 +765,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("think", cmd_think))
     app.add_handler(CommandHandler("tables", cmd_tables))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CommandHandler("query", cmd_query))
