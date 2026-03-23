@@ -100,6 +100,7 @@ RAG_EMBEDDING_BATCH = max(1, min(100, int(os.getenv("RAG_EMBEDDING_BATCH", "50")
 # Lưu lịch sử hội thoại theo user (chat_id -> list messages)
 user_conversations: Dict[int, List[dict]] = {}
 MAX_HISTORY = 20
+MAX_DB_HISTORY = max(4, min(60, int(os.getenv("MAX_DB_HISTORY", "24"))))
 
 # Lưu lịch sử /query riêng (chat_id -> list of {question, sql, answer})
 query_history: Dict[int, List[dict]] = {}
@@ -1170,9 +1171,43 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ======================= CHAT TỰ DO =======================
 
 def get_messages_for_user(chat_id: int) -> List[dict]:
-    if chat_id not in user_conversations:
+    if chat_id in user_conversations and user_conversations[chat_id]:
+        return user_conversations[chat_id][-MAX_HISTORY:]
+    sb = get_supabase_client()
+    if not sb:
         return []
-    return user_conversations[chat_id][-MAX_HISTORY:]
+    try:
+        res = (
+            sb.table(SUPABASE_CHAT_LOG_TABLE)
+            .select("direction,message_text,message_type")
+            .eq("chat_id", chat_id)
+            .order("created_at", desc=True)
+            .limit(MAX_DB_HISTORY * 2)
+            .execute()
+        )
+        rows = list(res.data or [])
+    except Exception as e:
+        logger.warning("Không đọc được lịch sử chat từ Supabase: %s", e)
+        return []
+
+    rows.reverse()
+    messages: List[dict] = []
+    for row in rows:
+        direction = (row.get("direction") or "").strip().lower()
+        content = (row.get("message_text") or "").strip()
+        message_type = (row.get("message_type") or "").strip().lower()
+        if not content:
+            continue
+        if message_type not in {"text", "caption", "other", "unknown"} and not content.startswith("["):
+            continue
+        if direction == "incoming":
+            role = "user"
+        elif direction == "outgoing":
+            role = "assistant"
+        else:
+            continue
+        messages.append({"role": role, "content": content})
+    return messages[-MAX_HISTORY:]
 
 
 def add_to_conversation(chat_id: int, role: str, content: str) -> None:
@@ -1215,7 +1250,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             system = "Bạn là trợ lý hữu ích. Trả lời ngắn gọn, rõ ràng."
         messages = [{"role": "system", "content": system}]
         messages.extend(history)
-        messages.append({"role": "user", "content": user_text})
+        if not history or history[-1].get("role") != "user" or history[-1].get("content") != user_text:
+            messages.append({"role": "user", "content": user_text})
 
         response = client.chat.completions.create(
             model=AI_MODEL,
