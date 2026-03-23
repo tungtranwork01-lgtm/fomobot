@@ -10,6 +10,7 @@ import json
 import os
 import re
 import logging
+import unicodedata
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 try:
@@ -748,11 +749,111 @@ def resolve_day_keyword(raw: str) -> Tuple[Optional[date], Optional[str]]:
     tz = ZoneInfo(GCALENDAR_TZ)
     today = datetime.now(tz).date()
     val = (raw or "").strip().lower()
-    if val in ("nay", "hôm nay", "hom nay", "today"):
+    normalized = unicodedata.normalize("NFD", val)
+    normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    m = re.search(r"(?<!\d)(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?(?!\d)", val)
+    if m:
+        dd = int(m.group(1))
+        mm = int(m.group(2))
+        yy_raw = m.group(3)
+        yy = today.year
+        if yy_raw:
+            yy = int(yy_raw)
+            if yy < 100:
+                yy += 2000
+        try:
+            return date(yy, mm, dd), None
+        except ValueError:
+            return None, "Ngày không hợp lệ. Ví dụ đúng: 26/03 hoặc 26/03/2026."
+
+    if any(x in normalized for x in ("hom nay", "ngay nay", "today")) or normalized == "nay":
         return today, None
-    if val in ("mai", "ngày mai", "ngay mai", "tomorrow"):
+    if any(x in normalized for x in ("ngay mai", "tomorrow")) or normalized == "mai":
         return today + timedelta(days=1), None
-    return None, "Dùng: /lich nay hoặc /lich mai"
+    if any(x in normalized for x in ("ngay kia", "hom kia", "mot")):
+        return today + timedelta(days=2), None
+    if "mai mot" in normalized:
+        return today + timedelta(days=2), None
+    if "cuoi tuan" in normalized:
+        delta = (5 - today.weekday()) % 7  # Saturday
+        return today + timedelta(days=delta), None
+    if "dau tuan" in normalized:
+        delta = (0 - today.weekday()) % 7  # Monday
+        return today + timedelta(days=delta), None
+
+    weekday_map_num = {
+        "2": 0,
+        "3": 1,
+        "4": 2,
+        "5": 3,
+        "6": 4,
+        "7": 5,
+    }
+    weekday_map_word = {
+        "hai": 0,
+        "ba": 1,
+        "tu": 2,
+        "nam": 3,
+        "sau": 4,
+        "bay": 5,
+    }
+    target_weekday: Optional[int] = None
+
+    m_num = re.search(r"\bthu\s*(2|3|4|5|6|7)\b", normalized)
+    if m_num:
+        target_weekday = weekday_map_num.get(m_num.group(1))
+    else:
+        m_word = re.search(r"\bthu\s+(hai|ba|tu|nam|sau|bay)\b", normalized)
+        if m_word:
+            target_weekday = weekday_map_word.get(m_word.group(1))
+        elif re.search(r"\b(chu nhat|cn)\b", normalized):
+            target_weekday = 6
+
+    if target_weekday is not None:
+        is_next_week = "tuan sau" in normalized or "next week" in normalized
+        is_this_week = "tuan nay" in normalized or "this week" in normalized
+
+        monday_this_week = today - timedelta(days=today.weekday())
+        if is_next_week:
+            monday = monday_this_week + timedelta(days=7)
+            return monday + timedelta(days=target_weekday), None
+        if is_this_week:
+            monday = monday_this_week
+            return monday + timedelta(days=target_weekday), None
+
+        delta = (target_weekday - today.weekday()) % 7
+        if delta == 0 and re.search(r"\bmai\b", normalized):
+            delta = 7
+        return today + timedelta(days=delta), None
+
+    return None, "Dùng: /lich nay, /lich mai hoặc /lich 26/03"
+
+
+def is_calendar_intent(user_text: str) -> bool:
+    val = (user_text or "").strip().lower()
+    normalized = unicodedata.normalize("NFD", val)
+    normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    calendar_keywords = (
+        "lich", "calendar", "schedule", "su kien", "lich trinh", "lich lam viec",
+    )
+    meeting_keywords = ("hop", "meeting", "cuoc hop")
+    day_hints = (
+        "hom nay", "ngay nay", "mai", "ngay mai", "ngay kia", "hom kia",
+        "tuan nay", "tuan sau", "thu ", "chu nhat", "cn", "cuoi tuan", "dau tuan",
+    )
+
+    if any(k in normalized for k in calendar_keywords):
+        return True
+    if any(k in normalized for k in meeting_keywords):
+        if any(h in normalized for h in day_hints):
+            return True
+        if re.search(r"(?<!\d)\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?(?!\d)", normalized):
+            return True
+    return False
 
 
 def summarize_schedule_with_ai(question: str, schedule_text: str) -> str:
@@ -822,12 +923,7 @@ async def answer_calendar_question(
 
     assert format_day_schedule is not None
     base_schedule = format_day_schedule(events or [], target_day, GCALENDAR_TZ)
-    question = custom_question or f"Hãy cho tôi biết lịch {day_raw} gồm những gì quan trọng."
-    try:
-        answer = await run_blocking(summarize_schedule_with_ai, question, base_schedule)
-    except Exception as e:
-        logger.exception("answer_calendar_question summarize: %s", e)
-        answer = base_schedule
+    answer = base_schedule
 
     if name:
         answer = f"Chào {name},\n\n{answer}"
@@ -1222,16 +1318,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not user_text or not user_text.strip():
         return
 
-    # Hỏi tự nhiên về lịch: "nay có lịch gì", "mai có họp không", ...
-    lowered = user_text.lower()
-    if "lịch" in lowered and ("nay" in lowered or "hôm nay" in lowered or "hom nay" in lowered):
-        handled = await answer_calendar_question(update, "nay", custom_question=user_text.strip())
-        if handled:
-            return
-    if "lịch" in lowered and ("mai" in lowered or "ngày mai" in lowered or "ngay mai" in lowered):
-        handled = await answer_calendar_question(update, "mai", custom_question=user_text.strip())
-        if handled:
-            return
+    # Hỏi tự nhiên về lịch: bắt intent + parse ngày từ toàn bộ câu.
+    if is_calendar_intent(user_text):
+        target_day, _ = resolve_day_keyword(user_text)
+        if target_day is not None:
+            handled = await answer_calendar_question(update, user_text.strip(), custom_question=user_text.strip())
+            if handled:
+                return
 
     await update.message.chat.send_action("typing")
 
