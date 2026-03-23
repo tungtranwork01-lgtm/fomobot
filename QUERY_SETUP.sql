@@ -1,4 +1,22 @@
 -- Chạy script này trong Supabase SQL Editor (Dashboard -> SQL Editor)
+--
+-- ============================================================
+-- 0. Google Calendar — cột OAuth refresh token (bảng user mặc định)
+--    Bot đọc useremail, gcal_refresh_token, Username, telegram_ID.
+--    Chạy phần này nếu gặp lỗi: column user.gcal_refresh_token does not exist
+-- ============================================================
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'user'
+      AND column_name = 'gcal_refresh_token'
+  ) THEN
+    ALTER TABLE public."user" ADD COLUMN gcal_refresh_token TEXT;
+  END IF;
+END $$;
+
 -- Tạo 2 hàm RPC để bot có thể:
 --   1. Đọc schema thật của CSDL (bảng, cột, kiểu dữ liệu)
 --   2. Chạy câu SQL SELECT an toàn (chỉ đọc, không sửa/xóa)
@@ -164,3 +182,25 @@ BEGIN
   LIMIT match_count;
 END;
 $$;
+
+-- ============================================================
+-- 6. Bảng log chat Telegram: lưu toàn bộ tin nhắn vào/ra bot
+-- ============================================================
+CREATE TABLE IF NOT EXISTS telegram_chat_logs (
+  id BIGSERIAL PRIMARY KEY,
+  chat_id BIGINT NOT NULL,
+  direction TEXT NOT NULL CHECK (direction IN ('incoming', 'outgoing')),
+  message_text TEXT NOT NULL DEFAULT '',
+  message_type TEXT NOT NULL DEFAULT 'text',
+  telegram_user_id BIGINT,
+  telegram_username TEXT,
+  telegram_full_name TEXT,
+  update_id BIGINT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS telegram_chat_logs_chat_id_idx
+  ON telegram_chat_logs (chat_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS telegram_chat_logs_created_at_idx
+  ON telegram_chat_logs (created_at DESC);
