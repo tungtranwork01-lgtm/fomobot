@@ -772,33 +772,19 @@ def resolve_day_keyword(raw: str) -> Tuple[Optional[date], Optional[str]]:
         return today, None
     if any(x in normalized for x in ("ngay mai", "tomorrow")) or normalized == "mai":
         return today + timedelta(days=1), None
-    if any(x in normalized for x in ("ngay kia", "hom kia", "mot")):
+    if any(x in normalized for x in ("ngay kia", "hom kia")):
         return today + timedelta(days=2), None
-    if "mai mot" in normalized:
+    if "mai mot" in normalized or "mai mốt" in val:
         return today + timedelta(days=2), None
     if "cuoi tuan" in normalized:
-        delta = (5 - today.weekday()) % 7  # Saturday
+        delta = (5 - today.weekday()) % 7
         return today + timedelta(days=delta), None
     if "dau tuan" in normalized:
-        delta = (0 - today.weekday()) % 7  # Monday
+        delta = (0 - today.weekday()) % 7
         return today + timedelta(days=delta), None
 
-    weekday_map_num = {
-        "2": 0,
-        "3": 1,
-        "4": 2,
-        "5": 3,
-        "6": 4,
-        "7": 5,
-    }
-    weekday_map_word = {
-        "hai": 0,
-        "ba": 1,
-        "tu": 2,
-        "nam": 3,
-        "sau": 4,
-        "bay": 5,
-    }
+    weekday_map_num = {"2": 0, "3": 1, "4": 2, "5": 3, "6": 4, "7": 5}
+    weekday_map_word = {"hai": 0, "ba": 1, "tu": 2, "nam": 3, "sau": 4, "bay": 5}
     target_weekday: Optional[int] = None
 
     m_num = re.search(r"\bthu\s*(2|3|4|5|6|7)\b", normalized)
@@ -814,7 +800,6 @@ def resolve_day_keyword(raw: str) -> Tuple[Optional[date], Optional[str]]:
     if target_weekday is not None:
         is_next_week = "tuan sau" in normalized or "next week" in normalized
         is_this_week = "tuan nay" in normalized or "this week" in normalized
-
         monday_this_week = today - timedelta(days=today.weekday())
         if is_next_week:
             monday = monday_this_week + timedelta(days=7)
@@ -824,8 +809,6 @@ def resolve_day_keyword(raw: str) -> Tuple[Optional[date], Optional[str]]:
             return monday + timedelta(days=target_weekday), None
 
         delta = (target_weekday - today.weekday()) % 7
-        if delta == 0 and re.search(r"\bmai\b", normalized):
-            delta = 7
         return today + timedelta(days=delta), None
 
     return None, "Dùng: /lich nay, /lich mai hoặc /lich 26/03"
@@ -837,9 +820,7 @@ def is_calendar_intent(user_text: str) -> bool:
     normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
     normalized = re.sub(r"\s+", " ", normalized).strip()
 
-    calendar_keywords = (
-        "lich", "calendar", "schedule", "su kien", "lich trinh", "lich lam viec",
-    )
+    calendar_keywords = ("lich", "calendar", "schedule", "su kien", "lich trinh", "lich lam viec")
     meeting_keywords = ("hop", "meeting", "cuoc hop")
     day_hints = (
         "hom nay", "ngay nay", "mai", "ngay mai", "ngay kia", "hom kia",
@@ -1015,7 +996,7 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_lich(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Tra lịch hôm nay/ngày mai và nhờ AI tóm tắt trước khi trả lời."""
+    """Tra lịch theo cách nói tự nhiên: nay/mai/dd/mm/thứ N..."""
     day_raw = " ".join(context.args or []).strip() if context.args else "nay"
     await answer_calendar_question(update, day_raw)
 
@@ -1318,13 +1299,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not user_text or not user_text.strip():
         return
 
-    # Hỏi tự nhiên về lịch: bắt intent + parse ngày từ toàn bộ câu.
     if is_calendar_intent(user_text):
         target_day, _ = resolve_day_keyword(user_text)
         if target_day is not None:
             handled = await answer_calendar_question(update, user_text.strip(), custom_question=user_text.strip())
             if handled:
                 return
+        await update.message.reply_text(
+            "Mình nhận ra bạn đang hỏi lịch, nhưng chưa rõ ngày. "
+            "Bạn thử ghi rõ: hôm nay, ngày mai, ngày kia, thứ mấy, hoặc 26/03."
+        )
+        return
 
     await update.message.chat.send_action("typing")
 
