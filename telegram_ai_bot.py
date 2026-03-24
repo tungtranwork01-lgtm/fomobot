@@ -20,6 +20,7 @@ except ImportError:
 
 from dotenv import load_dotenv
 from telegram import Bot, Update
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -93,6 +94,12 @@ GOOGLE_OAUTH_CLIENT_SECRET = (os.getenv("GOOGLE_OAUTH_CLIENT_SECRET") or "").str
 DAILY_CALENDAR_HOUR = max(0, min(23, int(os.getenv("DAILY_CALENDAR_HOUR", "7"))))
 DAILY_CALENDAR_MINUTE = max(0, min(59, int(os.getenv("DAILY_CALENDAR_MINUTE", "0"))))
 SUPABASE_USER_TABLE = (os.getenv("SUPABASE_USER_TABLE") or "user").strip() or "user"
+BOT_POLLING_ENABLED = (os.getenv("BOT_POLLING_ENABLED") or "true").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
 RAG_CHUNK_SIZE = max(100, min(2000, int(os.getenv("RAG_CHUNK_SIZE", "800"))))
 RAG_CHUNK_OVERLAP = max(0, min(200, int(os.getenv("RAG_CHUNK_OVERLAP", "100"))))
 RAG_TOP_K = max(1, min(20, int(os.getenv("RAG_TOP_K", "8"))))
@@ -161,10 +168,13 @@ def save_chat_log(
     sb = get_supabase_client()
     if not sb:
         return
+    msg_text = (message_text or "").strip()
+    if not msg_text:
+        return
     payload = {
         "chat_id": int(chat_id),
         "direction": (direction or "").strip().lower(),
-        "message_text": (message_text or "").strip(),
+        "message_text": msg_text,
         "message_type": (message_type or "text").strip().lower(),
         "telegram_user_id": int(telegram_user_id) if telegram_user_id else None,
         "telegram_username": (telegram_username or "").strip() or None,
@@ -174,7 +184,24 @@ def save_chat_log(
     try:
         sb.table(SUPABASE_CHAT_LOG_TABLE).insert(payload).execute()
     except Exception as e:
-        logger.warning("Không lưu được chat log: %s", e)
+        err = str(e).lower()
+        # Nếu bị trùng update_id do message đã xử lý ở instance khác, bỏ qua để tránh spam log.
+        if "duplicate key" in err or "unique constraint" in err:
+            logger.info(
+                "Bỏ qua chat log trùng (chat_id=%s, update_id=%s, direction=%s).",
+                chat_id,
+                update_id,
+                payload.get("direction"),
+            )
+            return
+        logger.warning(
+            "Không lưu được chat log vào bảng %s (chat_id=%s, update_id=%s, direction=%s): %s",
+            SUPABASE_CHAT_LOG_TABLE,
+            chat_id,
+            update_id,
+            payload.get("direction"),
+            e,
+        )
 
 
 def _extract_message_payload(update: Update) -> Tuple[str, str]:
@@ -1508,8 +1535,23 @@ def main() -> None:
     app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    if not BOT_POLLING_ENABLED:
+        logger.warning(
+            "BOT_POLLING_ENABLED=false -> bỏ qua run_polling. "
+            "Dùng biến này để đảm bảo chỉ 1 instance poll Telegram."
+        )
+        return
+
     logger.info("Bot đang chạy...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Conflict as e:
+        logger.error(
+            "Telegram Conflict: có instance khác đang getUpdates cùng bot token. "
+            "Hãy đảm bảo chỉ 1 instance đang chạy hoặc set BOT_POLLING_ENABLED=false cho instance phụ. Detail: %s",
+            e,
+        )
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
