@@ -4,18 +4,27 @@ Chạy: python telegram_ai_bot.py
 Cấu hình: copy .env.example thành .env và điền token/API key.
 """
 
+import asyncio
+import functools
 import json
 import os
 import re
 import logging
+import unicodedata
+from datetime import date, datetime, time as dtime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Bot, Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    TypeHandler,
     ContextTypes,
     filters,
 )
@@ -42,6 +51,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+async def run_blocking(func, *args, **kwargs):
+    """Chạy hàm đồng bộ trong thread pool (Python 3.8 không có asyncio.to_thread)."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
+
+
 # Cấu hình từ .env
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -64,6 +80,19 @@ _cached_schema: Optional[str] = None
 # RAG: Storage + embedding (OpenAI) + vector search
 SUPABASE_RAG_BUCKET = (os.getenv("SUPABASE_RAG_BUCKET") or "documents").strip()
 SUPABASE_RAG_TABLE = (os.getenv("SUPABASE_RAG_TABLE") or "rag_chunks").strip()
+SUPABASE_CHAT_LOG_TABLE = (os.getenv("SUPABASE_CHAT_LOG_TABLE") or "telegram_chat_logs").strip() or "telegram_chat_logs"
+
+# Google Calendar — nhắc lịch hàng ngày (Service Account Workspace hoặc OAuth + cột gcal_refresh_token)
+GCALENDAR_TZ = (
+    (os.getenv("GCALENDAR_TZ") or os.getenv("MS_CALENDAR_TZ") or "Asia/Ho_Chi_Minh").strip()
+    or "Asia/Ho_Chi_Minh"
+)
+GOOGLE_SERVICE_ACCOUNT_JSON = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip() or None
+GOOGLE_OAUTH_CLIENT_ID = (os.getenv("GOOGLE_OAUTH_CLIENT_ID") or "").strip() or None
+GOOGLE_OAUTH_CLIENT_SECRET = (os.getenv("GOOGLE_OAUTH_CLIENT_SECRET") or "").strip() or None
+DAILY_CALENDAR_HOUR = max(0, min(23, int(os.getenv("DAILY_CALENDAR_HOUR", "7"))))
+DAILY_CALENDAR_MINUTE = max(0, min(59, int(os.getenv("DAILY_CALENDAR_MINUTE", "0"))))
+SUPABASE_USER_TABLE = (os.getenv("SUPABASE_USER_TABLE") or "user").strip() or "user"
 RAG_CHUNK_SIZE = max(100, min(2000, int(os.getenv("RAG_CHUNK_SIZE", "800"))))
 RAG_CHUNK_OVERLAP = max(0, min(200, int(os.getenv("RAG_CHUNK_OVERLAP", "100"))))
 RAG_TOP_K = max(1, min(20, int(os.getenv("RAG_TOP_K", "8"))))
@@ -79,6 +108,10 @@ MAX_QUERY_HISTORY = 10
 
 # Bật/tắt chế độ thinking (reasoning) theo user: chat_id -> True/False
 user_thinking: Dict[int, bool] = {}
+
+# Cache service account JSON cho Google Calendar
+_cached_sa: Optional[Dict[str, Any]] = None
+_ORIGINAL_BOT_SEND_MESSAGE = Bot.send_message
 
 
 # ======================= CLIENTS =======================
@@ -109,6 +142,279 @@ def get_supabase_client() -> Optional[Any]:
     except Exception as e:
         logger.warning("Không tạo được Supabase client: %s", e)
         return None
+
+
+def save_chat_log(
+    *,
+    direction: str,
+    chat_id: Optional[int],
+    message_text: str,
+    message_type: str = "text",
+    telegram_user_id: Optional[int] = None,
+    telegram_username: Optional[str] = None,
+    telegram_full_name: Optional[str] = None,
+    update_id: Optional[int] = None,
+) -> None:
+    if not chat_id:
+        return
+    sb = get_supabase_client()
+    if not sb:
+        return
+    payload = {
+        "chat_id": int(chat_id),
+        "direction": (direction or "").strip().lower(),
+        "message_text": (message_text or "").strip(),
+        "message_type": (message_type or "text").strip().lower(),
+        "telegram_user_id": int(telegram_user_id) if telegram_user_id else None,
+        "telegram_username": (telegram_username or "").strip() or None,
+        "telegram_full_name": (telegram_full_name or "").strip() or None,
+        "update_id": int(update_id) if update_id is not None else None,
+    }
+    try:
+        sb.table(SUPABASE_CHAT_LOG_TABLE).insert(payload).execute()
+    except Exception as e:
+        logger.warning("Không lưu được chat log: %s", e)
+
+
+def _extract_message_payload(update: Update) -> Tuple[str, str]:
+    msg = update.effective_message
+    if not msg:
+        return "", "unknown"
+    if msg.text:
+        return msg.text, "text"
+    if msg.caption:
+        return msg.caption, "caption"
+    if msg.sticker:
+        return "[sticker]", "sticker"
+    if msg.photo:
+        return "[photo]", "photo"
+    if msg.video:
+        return "[video]", "video"
+    if msg.document:
+        return "[document]", "document"
+    if msg.voice:
+        return "[voice]", "voice"
+    if msg.audio:
+        return "[audio]", "audio"
+    if msg.location:
+        return "[location]", "location"
+    if msg.contact:
+        return "[contact]", "contact"
+    return "[unsupported]", "other"
+
+
+async def capture_incoming_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    chat = update.effective_chat
+    user = update.effective_user
+    chat_id = chat.id if chat else None
+    if chat_id is None:
+        return
+    text, message_type = _extract_message_payload(update)
+    save_chat_log(
+        direction="incoming",
+        chat_id=chat_id,
+        message_text=text,
+        message_type=message_type,
+        telegram_user_id=user.id if user else None,
+        telegram_username=user.username if user else None,
+        telegram_full_name=user.full_name if user else None,
+        update_id=update.update_id,
+    )
+
+
+async def patched_send_message(self: Bot, *args, **kwargs):
+    sent = await _ORIGINAL_BOT_SEND_MESSAGE(self, *args, **kwargs)
+    chat_id = kwargs.get("chat_id")
+    if chat_id is None and args:
+        chat_id = args[0]
+    text = kwargs.get("text")
+    if text is None and len(args) > 1:
+        text = args[1]
+    save_chat_log(
+        direction="outgoing",
+        chat_id=int(chat_id) if chat_id is not None else None,
+        message_text=str(text or ""),
+        message_type="text",
+        telegram_user_id=None,
+        telegram_username="bot",
+        telegram_full_name="bot",
+        update_id=None,
+    )
+    return sent
+
+
+# ======================= GOOGLE CALENDAR =======================
+
+GOOGLE_CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+
+
+def _load_service_account_dict() -> Optional[Dict[str, Any]]:
+    global _cached_sa
+    if _cached_sa is not None:
+        return _cached_sa
+    raw = (GOOGLE_SERVICE_ACCOUNT_JSON or "").strip()
+    if not raw:
+        return None
+    try:
+        if raw.startswith("{"):
+            _cached_sa = json.loads(raw)
+        else:
+            with open(raw, encoding="utf-8") as f:
+                _cached_sa = json.load(f)
+    except Exception as e:
+        logger.error("GOOGLE_SERVICE_ACCOUNT_JSON không đọc được: %s", e)
+        return None
+    return _cached_sa
+
+
+def _build_google_calendar_service_account(user_email: str) -> Tuple[Any, Optional[str]]:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    info = _load_service_account_dict()
+    if not info:
+        return None, "Thiếu GOOGLE_SERVICE_ACCOUNT_JSON (đường dẫn file hoặc chuỗi JSON)."
+
+    creds = service_account.Credentials.from_service_account_info(info, scopes=GOOGLE_CALENDAR_SCOPES)
+    creds = creds.with_subject(user_email.strip())
+    svc = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    return svc, None
+
+
+def _build_google_calendar_oauth(refresh_token: str) -> Tuple[Any, Optional[str]]:
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    cid = (GOOGLE_OAUTH_CLIENT_ID or "").strip()
+    csec = (GOOGLE_OAUTH_CLIENT_SECRET or "").strip()
+    if not cid or not csec:
+        return None, "Thiếu GOOGLE_OAUTH_CLIENT_ID hoặc GOOGLE_OAUTH_CLIENT_SECRET."
+
+    creds = Credentials(
+        token=None,
+        refresh_token=refresh_token.strip(),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=cid,
+        client_secret=csec,
+        scopes=GOOGLE_CALENDAR_SCOPES,
+    )
+    svc = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    return svc, None
+
+
+def fetch_calendar_events_for_day(
+    user_email: str,
+    day: date,
+    display_tz: str = "Asia/Ho_Chi_Minh",
+    oauth_refresh_token: Optional[str] = None,
+) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    tz = ZoneInfo(display_tz)
+    start_local = datetime.combine(day, datetime.min.time(), tzinfo=tz)
+    end_local = start_local + timedelta(days=1)
+    time_min = start_local.isoformat()
+    time_max = end_local.isoformat()
+
+    try:
+        service: Any = None
+        err: Optional[str] = None
+        rt = (oauth_refresh_token or "").strip()
+        if rt:
+            service, err = _build_google_calendar_oauth(rt)
+        else:
+            if not (user_email or "").strip():
+                return None, "Thiếu useremail khi dùng Service Account (Google Workspace)."
+            service, err = _build_google_calendar_service_account(user_email)
+
+        if err or not service:
+            return None, err or "Không tạo được Google Calendar client."
+
+        ev = (
+            service.events()
+            .list(
+                calendarId="primary",
+                timeMin=time_min,
+                timeMax=time_max,
+                singleEvents=True,
+                orderBy="startTime",
+                maxResults=100,
+                timeZone=display_tz,
+            )
+            .execute()
+        )
+        return list(ev.get("items") or []), None
+    except Exception as e:
+        logger.exception("fetch_calendar_events_for_day: %s", e)
+        return None, str(e)
+
+
+def _parse_google_start_end(
+    ev: Dict[str, Any],
+    display_tz: str,
+) -> Tuple[bool, datetime, datetime, str]:
+    start = ev.get("start") or {}
+    end = ev.get("end") or {}
+    loc = (ev.get("location") or "").strip()
+
+    if "date" in start and "dateTime" not in start:
+        try:
+            d0 = datetime.strptime(str(start.get("date")), "%Y-%m-%d").date()
+        except ValueError:
+            d0 = datetime.now(ZoneInfo(display_tz)).date()
+        tz = ZoneInfo(display_tz)
+        st = datetime.combine(d0, datetime.min.time(), tzinfo=tz)
+        en_d = str(end.get("date") or start.get("date"))
+        try:
+            d1 = datetime.strptime(en_d, "%Y-%m-%d").date()
+        except ValueError:
+            d1 = d0
+        en = datetime.combine(d1, datetime.min.time(), tzinfo=tz)
+        return True, st, en, loc
+
+    st_s = str(start.get("dateTime") or "")
+    en_s = str(end.get("dateTime") or "")
+    if st_s.endswith("Z"):
+        st_s = st_s[:-1] + "+00:00"
+    if en_s.endswith("Z"):
+        en_s = en_s[:-1] + "+00:00"
+    try:
+        st = datetime.fromisoformat(st_s)
+    except ValueError:
+        st = datetime.now(ZoneInfo(display_tz))
+    try:
+        en = datetime.fromisoformat(en_s)
+    except ValueError:
+        en = st
+    if st.tzinfo is None:
+        st = st.replace(tzinfo=ZoneInfo(display_tz))
+    if en.tzinfo is None:
+        en = en.replace(tzinfo=ZoneInfo(display_tz))
+    st = st.astimezone(ZoneInfo(display_tz))
+    en = en.astimezone(ZoneInfo(display_tz))
+    return False, st, en, loc
+
+
+def format_day_schedule(
+    events: List[Dict[str, Any]],
+    day: date,
+    display_tz: str = "Asia/Ho_Chi_Minh",
+) -> str:
+    if not events:
+        return f"Lịch ngày {day.strftime('%d/%m/%Y')}: không có sự kiện trên Google Calendar."
+
+    lines: List[str] = [f"Lịch ngày {day.strftime('%d/%m/%Y')} (giờ {display_tz}):"]
+    for ev in events:
+        subj = (ev.get("summary") or "(Không tiêu đề)").strip()
+        is_all, st, en, loc = _parse_google_start_end(ev, display_tz)
+        if is_all:
+            piece = f"• Cả ngày: {subj}"
+        else:
+            piece = f"• {st.strftime('%H:%M')}–{en.strftime('%H:%M')}: {subj}"
+        if loc:
+            piece += f" — {loc}"
+        lines.append(piece)
+
+    return "\n".join(lines)
 
 
 # ======================= DB SCHEMA + SQL =======================
@@ -389,6 +695,227 @@ def extract_keywords_from_question(client: OpenAI, question: str) -> List[str]:
         return question.split()[:5]
 
 
+def get_user_calendar_profile(sb: Any, chat_id: int) -> Tuple[Optional[str], Optional[str], str, Optional[str]]:
+    """
+    Tìm profile lịch theo telegram chat_id.
+    Trả về: (email, refresh_token, display_name, error)
+    """
+    try:
+        r = (
+            sb.table(SUPABASE_USER_TABLE)
+            .select("useremail,gcal_refresh_token,Username,telegram_ID")
+            .eq("telegram_ID", str(chat_id))
+            .limit(1)
+            .execute()
+        )
+        rows = r.data or []
+        if not rows:
+            return (
+                None,
+                None,
+                "",
+                "Không thấy bạn trong bảng user (telegram_ID).\n\n"
+                "Chưa có lệnh đăng ký tự động — cần thêm tay trên Supabase:\n"
+                "1) Gõ /id để xem Chat ID.\n"
+                "2) Dashboard → Table Editor → bảng user → Insert row.\n"
+                "3) Điền telegram_ID = đúng số từ /id (dạng text), thêm useremail; "
+                "nếu dùng OAuth Google thì điền gcal_refresh_token.",
+            )
+        row = rows[0] or {}
+        email = (row.get("useremail") or "").strip() or None
+        refresh = (row.get("gcal_refresh_token") or "").strip() or None
+        name = (row.get("Username") or "").strip()
+        if not refresh and not (GOOGLE_SERVICE_ACCOUNT_JSON and email):
+            return (
+                email,
+                refresh,
+                name,
+                "Thiếu kết nối Google Calendar. Cần một trong hai:\n\n"
+                "• Workspace: trong .env có GOOGLE_SERVICE_ACCOUNT_JSON; "
+                "Admin Google ủy quyền domain cho service account (scope calendar.readonly); "
+                "trên Supabase dòng của bạn có useremail đúng email @côngty.\n\n"
+                "• Gmail cá nhân: trong .env có GOOGLE_OAUTH_CLIENT_ID và GOOGLE_OAUTH_CLIENT_SECRET (OAuth Web); "
+                "chạy get_gcal_refresh_token.py (redirect URI trong Console khớp GOOGLE_OAUTH_REDIRECT_URI), "
+                "dán refresh token vào cột gcal_refresh_token trên Supabase.",
+            )
+        return email, refresh, name, None
+    except Exception as e:
+        logger.exception("get_user_calendar_profile: %s", e)
+        return None, None, "", str(e)
+
+
+def resolve_day_keyword(raw: str) -> Tuple[Optional[date], Optional[str]]:
+    tz = ZoneInfo(GCALENDAR_TZ)
+    today = datetime.now(tz).date()
+    val = (raw or "").strip().lower()
+    normalized = unicodedata.normalize("NFD", val)
+    normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    m = re.search(r"(?<!\d)(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?(?!\d)", val)
+    if m:
+        dd = int(m.group(1))
+        mm = int(m.group(2))
+        yy_raw = m.group(3)
+        yy = today.year
+        if yy_raw:
+            yy = int(yy_raw)
+            if yy < 100:
+                yy += 2000
+        try:
+            return date(yy, mm, dd), None
+        except ValueError:
+            return None, "Ngày không hợp lệ. Ví dụ đúng: 26/03 hoặc 26/03/2026."
+
+    if any(x in normalized for x in ("hom nay", "ngay nay", "today")) or normalized == "nay":
+        return today, None
+    if any(x in normalized for x in ("ngay mai", "tomorrow")) or normalized == "mai":
+        return today + timedelta(days=1), None
+    if any(x in normalized for x in ("ngay kia", "hom kia")):
+        return today + timedelta(days=2), None
+    if "mai mot" in normalized or "mai mốt" in val:
+        return today + timedelta(days=2), None
+    if "cuoi tuan" in normalized:
+        delta = (5 - today.weekday()) % 7
+        return today + timedelta(days=delta), None
+    if "dau tuan" in normalized:
+        delta = (0 - today.weekday()) % 7
+        return today + timedelta(days=delta), None
+
+    weekday_map_num = {"2": 0, "3": 1, "4": 2, "5": 3, "6": 4, "7": 5}
+    weekday_map_word = {"hai": 0, "ba": 1, "tu": 2, "nam": 3, "sau": 4, "bay": 5}
+    target_weekday: Optional[int] = None
+
+    m_num = re.search(r"\bthu\s*(2|3|4|5|6|7)\b", normalized)
+    if m_num:
+        target_weekday = weekday_map_num.get(m_num.group(1))
+    else:
+        m_word = re.search(r"\bthu\s+(hai|ba|tu|nam|sau|bay)\b", normalized)
+        if m_word:
+            target_weekday = weekday_map_word.get(m_word.group(1))
+        elif re.search(r"\b(chu nhat|cn)\b", normalized):
+            target_weekday = 6
+
+    if target_weekday is not None:
+        is_next_week = "tuan sau" in normalized or "next week" in normalized
+        is_this_week = "tuan nay" in normalized or "this week" in normalized
+        monday_this_week = today - timedelta(days=today.weekday())
+
+        if is_next_week:
+            monday = monday_this_week + timedelta(days=7)
+            return monday + timedelta(days=target_weekday), None
+        if is_this_week:
+            monday = monday_this_week
+            return monday + timedelta(days=target_weekday), None
+
+        delta = (target_weekday - today.weekday()) % 7
+        return today + timedelta(days=delta), None
+
+    return None, "Dùng: /lich nay, /lich mai hoặc /lich 26/03"
+
+
+def is_calendar_intent(user_text: str) -> bool:
+    val = (user_text or "").strip().lower()
+    normalized = unicodedata.normalize("NFD", val)
+    normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    calendar_keywords = ("lich", "calendar", "schedule", "su kien", "lich trinh", "lich lam viec")
+    meeting_keywords = ("hop", "meeting", "cuoc hop")
+    day_hints = (
+        "hom nay", "ngay nay", "mai", "ngay mai", "ngay kia", "hom kia",
+        "tuan nay", "tuan sau", "thu ", "chu nhat", "cn", "cuoi tuan", "dau tuan",
+    )
+
+    if any(k in normalized for k in calendar_keywords):
+        return True
+    if any(k in normalized for k in meeting_keywords):
+        if any(h in normalized for h in day_hints):
+            return True
+        if re.search(r"(?<!\d)\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?(?!\d)", normalized):
+            return True
+    return False
+
+
+def summarize_schedule_with_ai(question: str, schedule_text: str) -> str:
+    """Nhờ AI duyệt/tóm tắt lịch theo câu hỏi người dùng (đồng bộ — chạy trong thread qua run_blocking)."""
+    client = get_openai_client()
+    resp = client.chat.completions.create(
+        model=AI_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Bạn là trợ lý lịch làm việc. Dựa vào lịch trong ngày được cung cấp, "
+                    "hãy trả lời ngắn gọn bằng tiếng Việt. "
+                    "Nếu không có lịch thì nói rõ không có cuộc họp/sự kiện."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Câu hỏi: {question}\n\nDữ liệu lịch:\n{schedule_text}",
+            },
+        ],
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+async def answer_calendar_question(
+    update: Update,
+    day_raw: str,
+    custom_question: Optional[str] = None,
+) -> bool:
+    """Trả lời lịch theo ngày. Trả True nếu đã xử lý xong."""
+    if not gcalendar_ready():
+        await update.message.reply_text("Google Calendar chưa sẵn sàng. Kiểm tra GOOGLE_* trong .env.")
+        return True
+    sb = get_supabase_client()
+    if not sb:
+        await update.message.reply_text("Chưa cấu hình Supabase.")
+        return True
+
+    target_day, day_err = resolve_day_keyword(day_raw)
+    if day_err or not target_day:
+        await update.message.reply_text(day_err or "Tham số ngày không hợp lệ.")
+        return True
+
+    chat_id = update.effective_chat.id
+    email, refresh, name, profile_err = get_user_calendar_profile(sb, chat_id)
+    if profile_err:
+        await update.message.reply_text(profile_err)
+        return True
+
+    await update.message.chat.send_action("typing")
+    try:
+        events, err = await run_blocking(
+            fetch_calendar_events_for_day,
+            email or "",
+            target_day,
+            GCALENDAR_TZ,
+            refresh,
+        )
+    except Exception as e:
+        logger.exception("answer_calendar_question fetch_calendar: %s", e)
+        await update.message.reply_text(f"Lấy lịch lỗi: {e}")
+        return True
+    if err:
+        await update.message.reply_text(f"Lấy lịch lỗi: {err}")
+        return True
+
+    assert format_day_schedule is not None
+    base_schedule = format_day_schedule(events or [], target_day, GCALENDAR_TZ)
+    answer = base_schedule
+
+    if name:
+        answer = f"Chào {name},\n\n{answer}"
+    if len(answer) > 4000:
+        for i in range(0, len(answer), 4000):
+            await update.message.reply_text(answer[i : i + 4000])
+    else:
+        await update.message.reply_text(answer)
+    return True
+
+
 # ======================= TELEGRAM HANDLERS =======================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -398,10 +925,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/model - Xem model đang dùng.",
         "/think - Bật/tắt chế độ suy nghĩ (reasoning): AI sẽ trình bày bước suy luận trước khi trả lời.",
     ]
+    if gcalendar_ready():
+        lines.append(
+            f"(Bot sẽ gửi lịch Google Calendar mỗi ngày khoảng {DAILY_CALENDAR_HOUR:02d}:{DAILY_CALENDAR_MINUTE:02d} giờ {GCALENDAR_TZ} nếu bạn có trong Supabase.)"
+        )
+        lines.append("/lich <nay|mai> - Xem lịch Google Calendar đã qua AI duyệt.")
     if get_supabase_client():
         lines.append("/query <câu hỏi> - Truy vấn CSDL bằng ngôn ngữ tự nhiên.")
         lines.append("/tables - Xem cấu trúc CSDL (bảng, cột).")
         lines.append("/refresh - Cập nhật lại cache schema.")
+        lines.append("/id - Xem Chat ID (để thêm vào bảng user / lịch Google Calendar).")
     if get_supabase_client() and SUPABASE_RAG_BUCKET:
         lines.append("/rag_index - Index file trong Supabase Storage vào RAG.")
         lines.append("/ask <câu hỏi> - Trả lời dựa trên tài liệu đã index (RAG).")
@@ -415,6 +948,27 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if chat_id in query_history:
         del query_history[chat_id]
     await update.message.reply_text("Đã xóa lịch sử hội thoại và lịch sử truy vấn.")
+
+
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Chat ID dùng cho cột telegram_ID trong bảng user (Supabase)."""
+    cid = update.effective_chat.id
+    chat_type = update.effective_chat.type
+    user = update.effective_user
+    # Không dùng Markdown/HTML: username có dấu _ hoặc ký tự đặc biệt sẽ làm Telegram báo lỗi parse entity.
+    parts = [f"Chat ID: {cid}"]
+    if user and user.username:
+        parts.append(f"Username: @{user.username}")
+    if chat_type == "private":
+        parts.append(
+            "Trong chat riêng, số trên là ID của bạn — dán vào cột telegram_ID (text) "
+            "khi thêm dòng trong bảng user trên Supabase."
+        )
+    else:
+        parts.append(
+            "Đây là ID nhóm/kênh. Lịch cá nhân thường cấu hình bằng Chat ID lấy từ tin nhắn riêng với bot."
+        )
+    await update.message.reply_text("\n".join(parts))
 
 
 async def cmd_think(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -439,6 +993,12 @@ async def cmd_think(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     base = OPENAI_BASE_URL or "api.openai.com"
     await update.message.reply_text(f"Model: {AI_MODEL}\nBase URL: {base}")
+
+
+async def cmd_lich(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tra lịch theo cách nói tự nhiên: nay/mai/dd/mm/thứ N..."""
+    day_raw = " ".join(context.args or []).strip() if context.args else "nay"
+    await answer_calendar_question(update, day_raw)
 
 
 async def cmd_tables(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -705,6 +1265,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not user_text or not user_text.strip():
         return
 
+    if is_calendar_intent(user_text):
+        target_day, _ = resolve_day_keyword(user_text)
+        if target_day is not None:
+            handled = await answer_calendar_question(update, user_text.strip(), custom_question=user_text.strip())
+            if handled:
+                return
+        await update.message.reply_text(
+            "Mình nhận ra bạn đang hỏi lịch, nhưng chưa rõ ngày. "
+            "Bạn thử ghi rõ: hôm nay, ngày mai, ngày kia, thứ mấy, hoặc 26/03."
+        )
+        return
+
     await update.message.chat.send_action("typing")
 
     try:
@@ -749,6 +1321,128 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
+# ======================= NHẮC LỊCH GOOGLE (hàng ngày) =======================
+
+
+def gcalendar_ready() -> bool:
+    """Cần file JSON service account (Workspace), hoặc OAuth client + refresh token từng user trong DB."""
+    if not fetch_calendar_events_for_day or not format_day_schedule:
+        return False
+    sa = bool(GOOGLE_SERVICE_ACCOUNT_JSON)
+    oauth = bool(GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET)
+    return sa or oauth
+
+
+def parse_telegram_chat_id(raw: Any) -> Optional[int]:
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
+async def daily_calendar_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue: gửi lịch Google Calendar trong ngày cho từng user có telegram_ID + useremail."""
+    if not gcalendar_ready():
+        logger.warning(
+            "Nhắc lịch: thiếu google_calendar hoặc cấu hình Google (GOOGLE_SERVICE_ACCOUNT_JSON hoặc OAuth client)."
+        )
+        return
+    sb = get_supabase_client()
+    if not sb:
+        logger.warning("Nhắc lịch: chưa cấu hình Supabase.")
+        return
+
+    try:
+        res = sb.table(SUPABASE_USER_TABLE).select("*").execute()
+        rows = res.data or []
+    except Exception as e:
+        logger.exception("Nhắc lịch: đọc bảng %s: %s", SUPABASE_USER_TABLE, e)
+        return
+
+    tz = ZoneInfo(GCALENDAR_TZ)
+    today_local = datetime.now(tz).date()
+    bot = context.application.bot
+
+    for row in rows:
+        email = (row.get("useremail") or "").strip()
+        chat_id = parse_telegram_chat_id(row.get("telegram_ID"))
+        refresh = (row.get("gcal_refresh_token") or "").strip() or None
+        if not chat_id:
+            continue
+        if refresh:
+            pass
+        elif GOOGLE_SERVICE_ACCOUNT_JSON and email:
+            pass
+        else:
+            continue
+
+        try:
+            events, err = await run_blocking(
+                fetch_calendar_events_for_day,
+                email,
+                today_local,
+                GCALENDAR_TZ,
+                refresh,
+            )
+        except Exception as e:
+            logger.exception("Nhắc lịch fetch_calendar %s: %s", chat_id, e)
+            err = str(e)
+            events = None
+        if err:
+            who = email or (f"gcal_refresh…{refresh[:6]}" if refresh else "?")
+            logger.warning("Lịch %s: %s", who, err)
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "Không lấy được lịch Google Calendar hôm nay. "
+                        "Kiểm tra: Workspace + service account ủy quyền domain, hoặc cột gcal_refresh_token + OAuth."
+                    ),
+                )
+            except Exception as se:
+                logger.warning("Gửi lỗi lịch tới %s: %s", chat_id, se)
+            continue
+
+        assert format_day_schedule is not None
+        text = format_day_schedule(events or [], today_local, GCALENDAR_TZ)
+        name = (row.get("Username") or "").strip()
+        if name:
+            text = f"Chào {name},\n\n{text}"
+        try:
+            if len(text) > 4000:
+                for i in range(0, len(text), 4000):
+                    await bot.send_message(chat_id=chat_id, text=text[i : i + 4000])
+            else:
+                await bot.send_message(chat_id=chat_id, text=text)
+        except Exception as se:
+            logger.warning("Gửi lịch tới %s: %s", chat_id, se)
+
+
+async def post_init_schedule(application: Application) -> None:
+    """Lên lịch 7h sáng (có thể đổi bằng DAILY_CALENDAR_HOUR/MINUTE, GCALENDAR_TZ)."""
+    jq = application.job_queue
+    if not jq:
+        logger.warning(
+            "Không có JobQueue. Cài: pip install 'python-telegram-bot[job-queue]' (đã khai trong requirements.txt)."
+        )
+        return
+    if not gcalendar_ready():
+        logger.info("Nhắc lịch Google: tắt (thiếu GOOGLE_* / google_calendar).")
+        return
+    tz = ZoneInfo(GCALENDAR_TZ)
+    when = dtime(hour=DAILY_CALENDAR_HOUR, minute=DAILY_CALENDAR_MINUTE, tzinfo=tz)
+    jq.run_daily(daily_calendar_reminder, time=when, name="daily_gcalendar")
+    logger.info(
+        "Đã bật nhắc lịch hàng ngày lúc %02d:%02d (%s).",
+        DAILY_CALENDAR_HOUR,
+        DAILY_CALENDAR_MINUTE,
+        GCALENDAR_TZ,
+    )
+
+
 # ======================= MAIN =======================
 
 def main() -> None:
@@ -757,14 +1451,20 @@ def main() -> None:
     if not OPENAI_API_KEY:
         raise SystemExit("Thiếu OPENAI_API_KEY trong .env")
 
+    Bot.send_message = patched_send_message
+
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init_schedule)
         .build()
     )
+    app.add_handler(TypeHandler(Update, capture_incoming_update), group=-1)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("lich", cmd_lich))
     app.add_handler(CommandHandler("think", cmd_think))
     app.add_handler(CommandHandler("tables", cmd_tables))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
